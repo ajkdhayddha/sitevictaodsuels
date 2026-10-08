@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>DOOM DUELO · CHROMOS</title>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <style>
 :root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 html,body{margin:0;height:100%;background:#0a0000;color:#c66;font-family:'Press Start 2P',monospace,Courier}
@@ -61,7 +62,7 @@ function commit(){L.forEach(l=>l.rounds.push(l.rs));endT=performance.now();state
 function update(){
  t++;shake*=.85;
  parts.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vy+=.3;p.l--});parts=parts.filter(p=>p.l>0);
- if(state==='queue'&&!room)return;
+ if(state==='queue')return;
  if(mode==='online'&&gr&&state!=='menu'&&state!=='queue'){
   const ps=gr.peers();if(ps.length<2){if(++lostT>180){endOnline();msg='RIVAL SAIU DA PARTIDA';state='menu'}}else lostT=0;
   const o=ps.find(p=>!p.isMe);
@@ -89,10 +90,13 @@ function update(){
 }
 // ---------- online ----------
 async function goOnline(){
- if(!(window.claude&&claude.use)){msg='ONLINE INDISPONIVEL AQUI';return}
  state='queue';qStart=performance.now();matched=false;msg='';
- try{room=await claude.use('room')}catch(e){room=null}
- if(!room){state='menu';msg='ONLINE INDISPONIVEL (ABRA LOGADO)';return}
+ room=null;
+ if(window.claude&&claude.use){try{room=await claude.use('room')}catch(e){room=null}}
+ if(!room){
+  if(window.Peer)return peerMatch();
+  state='menu';msg='ONLINE INDISPONIVEL (SEM SERVIDOR)';return;
+ }
  room.presence({mm:'q',ts:Date.now()}).catch(()=>{});
  const un=room.onPeers(ch=>{
   if(state!=='queue'||matched)return;
@@ -102,18 +106,72 @@ async function goOnline(){
   matched=true;un();startMatch(q[Math.min(i,j)],q[Math.max(i,j)]);
  });
 }
+// ---- matchmaking P2P (PeerJS) para uso fora do claude.ai ----
+let peerObj=null;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function mkNet(conn){
+ const pr={},hs={};
+ conn.on('data',m=>{if(!m)return;if(m.t==='p')Object.assign(pr,m.d);else if(m.t==='e'&&hs[m.tp])hs[m.tp]({isMe:false,data:m.d})});
+ return{
+  presence(p){if(conn.open)conn.send({t:'p',d:p});return Promise.resolve()},
+  emit(tp,d){if(conn.open)conn.send({t:'e',tp,d});return Promise.resolve()},
+  on(tp,f){hs[tp]=f},
+  peers(){return conn.open?[{isMe:true,presence:{}},{isMe:false,peer:conn.peer,presence:pr}]:[{isMe:true,presence:{}}]},
+  leave(){try{conn.close()}catch(e){}}
+ };
+}
+function tryHost(id){return new Promise(res=>{
+ const p=new Peer(id);let done=false;
+ const fin=v=>{if(!done){done=true;res(v);if(!v){try{p.destroy()}catch(_){}}}};
+ p.on('open',()=>fin(p));p.on('error',()=>fin(null));setTimeout(()=>fin(null),6000);
+})}
+function tryGuest(id){return new Promise(res=>{
+ const p=new Peer();let done=false;
+ const fin=v=>{if(!done){done=true;res(v);if(!v){try{p.destroy()}catch(_){}}}};
+ p.on('error',()=>fin(null));
+ p.on('open',()=>{const c=p.connect(id,{reliable:true});
+  c.on('data',m=>{if(m&&m.t==='hi')fin({p,c});else if(m&&m.t==='busy')fin(null)});
+  c.on('close',()=>fin(null));c.on('error',()=>fin(null))});
+ setTimeout(()=>fin(null),5000);
+})}
+async function peerMatch(){
+ while(state==='queue'&&!matched){
+  for(let s=1;s<=6&&state==='queue'&&!matched;s++){
+   const id='chromosduelo-v1-slot'+s;
+   const h=await tryHost(id);
+   if(h){
+    if(state!=='queue'){try{h.destroy()}catch(_){}return}
+    peerObj=h;
+    h.on('connection',c=>c.on('open',()=>{
+     if(matched||state!=='queue'){c.send({t:'busy'});setTimeout(()=>c.close(),300);return}
+     matched=true;c.send({t:'hi'});gr=mkNet(c);wireNet();newGame('online');
+    }));
+    const end=performance.now()+8000+Math.random()*4000;
+    while(state==='queue'&&!matched&&performance.now()<end)await sleep(200);
+    if(matched)return;
+    try{h.destroy()}catch(_){}peerObj=null;break;
+   }else{
+    const r=await tryGuest(id);
+    if(r&&state==='queue'){matched=true;peerObj=r.p;gr=mkNet(r.c);wireNet();newGame('online');return}
+    if(r){try{r.p.destroy()}catch(_){}}
+   }
+  }
+  await sleep(300);
+ }
+}
+function wireNet(){gr.on('shot',m=>{if(m.isMe||state==='menu')return;const d=m.data||{};if(d.r!==round)return;addHit(L[1],d.x,d.y,d.dx,d.dy,d.p)})}
 async function startMatch(a,b){
  const n=s=>s.toLowerCase().replace(/[^a-z0-9]/g,'');
  try{
   await room.presence({mm:'g'});
   gr=await room.join('g-'+n(a.peer)+'-'+n(b.peer));
-  gr.on('shot',m=>{if(m.isMe||state==='menu')return;const d=m.data||{};if(d.r!==round)return;addHit(L[1],d.x,d.y,d.dx,d.dy,d.p)});
+  wireNet();
   const t0=performance.now();
   const wait=()=>{if(state!=='queue')return;if(gr.peers().length>=2){newGame('online')}else if(performance.now()-t0>12000){endOnline();msg='FALHA AO CONECTAR';state='menu'}else setTimeout(wait,200)};
   wait();
  }catch(e){endOnline();msg='FALHA NO MATCH';state='menu'}
 }
-function endOnline(){try{if(gr)gr.leave()}catch(e){}gr=null;if(room){room.presence({mm:null}).catch(()=>{})}matched=false}
+function endOnline(){try{if(gr)gr.leave()}catch(e){}gr=null;try{if(peerObj)peerObj.destroy()}catch(e){}peerObj=null;if(room){room.presence({mm:null}).catch(()=>{})}matched=false}
 function toMenu(){endOnline();state='menu';mode=''}
 // ---------- entrada ----------
 function pos(e){const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height}}
