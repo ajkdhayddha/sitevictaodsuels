@@ -107,7 +107,7 @@ async function goOnline(){
  });
 }
 // ---- matchmaking P2P (PeerJS) para uso fora do claude.ai ----
-let peerObj=null;
+let peerObj=null,perr='';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function mkNet(conn){
  const pr={},hs={};
@@ -123,12 +123,12 @@ function mkNet(conn){
 function tryHost(id){return new Promise(res=>{
  const p=new Peer(id);let done=false;
  const fin=v=>{if(!done){done=true;res(v);if(!v){try{p.destroy()}catch(_){}}}};
- p.on('open',()=>fin(p));p.on('error',()=>fin(null));setTimeout(()=>fin(null),6000);
+ p.on('open',()=>fin(p));p.on('error',e=>{if(e.type!=='unavailable-id')perr=e.type;fin(null)});setTimeout(()=>fin(null),6000);
 })}
 function tryGuest(id){return new Promise(res=>{
  const p=new Peer();let done=false;
  const fin=v=>{if(!done){done=true;res(v);if(!v){try{p.destroy()}catch(_){}}}};
- p.on('error',()=>fin(null));
+ p.on('error',e=>{perr=e.type;fin(null)});
  p.on('open',()=>{const c=p.connect(id,{reliable:true});
   c.on('data',m=>{if(m&&m.t==='hi')fin({p,c});else if(m&&m.t==='busy')fin(null)});
   c.on('close',()=>fin(null));c.on('error',()=>fin(null))});
@@ -246,10 +246,12 @@ function draw(){
   if(state==='menu'){
    btns.forEach(b=>{g.fillStyle='#300';g.fillRect(W/2-260,b.y-22,520,44);g.strokeStyle='#a00';g.lineWidth=2;g.strokeRect(W/2-260,b.y-22,520,44);txt(b.s,W/2,b.y+5,12,'#ff0')});
    if(msg)txt(msg,W/2,470,10,'#f55');
+   txt('VERSAO 3 - P2P '+(window.Peer?'OK':'SEM PEERJS'),W-14,H-12,8,'#c33','right');
   }else{
    const s=((performance.now()-qStart)/1000)|0;
    txt('PROCURANDO RIVAL'+'.'.repeat(1+(t/20|0)%3),W/2,340,16,'#ff0');
    txt('AGUARDANDO '+s+'s  ·  ESC CANCELA',W/2,380,10,'#ccc');
+   if(perr)txt('ERRO DE REDE: '+perr,W/2,455,9,'#f55');
    if(s>8)txt('NINGUEM? ABRA EM OUTRA ABA OU JOGUE CONTRA O BOT',W/2,425,9,'#a66');
   }
   return;
