@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>DOOM DUELO · CHROMOS</title>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <style>
 :root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 html,body{margin:0;height:100%;background:#0a0000;color:#c66;font-family:'Press Start 2P',monospace,Courier}
@@ -86,7 +86,7 @@ function update(){
   if(L[0].done&&L[1].done)commit();
  }
  if(state==='roundEnd'&&mode==='online'&&myRd>=round&&L[1].opRd>=round)advance();
- if(mode==='online'&&gr&&t%2===0&&state!=='menu'&&state!=='queue'){const a=L[0];gr.presence({cx:Math.round(a.cx-a.x0),cy:Math.round(a.cy),tx:Math.round(a.tx),ty:Math.round(a.ty),sh:a.shots,rs:a.rs,fl:a.fc,dn:a.done?round:0,rd:myRd}).catch(()=>{})}
+ if(mode==='online'&&gr&&t%4===0&&state!=='menu'&&state!=='queue'){const a=L[0];gr.presence({cx:Math.round(a.cx-a.x0),cy:Math.round(a.cy),tx:Math.round(a.tx),ty:Math.round(a.ty),sh:a.shots,rs:a.rs,fl:a.fc,dn:a.done?round:0,rd:myRd}).catch(()=>{})}
 }
 // ---------- online ----------
 async function goOnline(){
@@ -94,7 +94,7 @@ async function goOnline(){
  room=null;
  if(window.claude&&claude.use){try{room=await claude.use('room')}catch(e){room=null}}
  if(!room){
-  if(window.Peer)return peerMatch();
+  if(window.mqtt)return mqMatch();
   state='menu';msg='ONLINE INDISPONIVEL (SEM SERVIDOR)';return;
  }
  room.presence({mm:'q',ts:Date.now()}).catch(()=>{});
@@ -106,59 +106,71 @@ async function goOnline(){
   matched=true;un();startMatch(q[Math.min(i,j)],q[Math.max(i,j)]);
  });
 }
-// ---- matchmaking P2P (PeerJS) para uso fora do claude.ai ----
-let peerObj=null,perr='';
+// MQTT-BEGIN
+// ---- matchmaking via broker MQTT publico (funciona em qualquer site, sem NAT/TURN) ----
+let mqc=null,perr='';
+const MQ_URLS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+const NS='chromosduelo-v1/',myId=Math.random().toString(36).slice(2,10);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-function mkNet(conn){
- const pr={},hs={};
- conn.on('data',m=>{if(!m)return;if(m.t==='p')Object.assign(pr,m.d);else if(m.t==='e'&&hs[m.tp])hs[m.tp]({isMe:false,data:m.d})});
+function mqConnect(){return new Promise((res,rej)=>{
+ let i=0;
+ const next=()=>{
+  if(i>=MQ_URLS.length)return rej(new Error('broker'));
+  const url=MQ_URLS[i++];let done=false;
+  const c=mqtt.connect(url,{clientId:'cd'+Math.random().toString(16).slice(2,10),clean:true,reconnectPeriod:0,connectTimeout:7000});
+  c.on('connect',()=>{if(!done){done=true;res(c)}});
+  c.on('error',e=>{perr=(e&&e.message)||'erro';if(!done){done=true;try{c.end(true)}catch(_){}next()}});
+  c.on('close',()=>{if(!done){done=true;next()}});
+ };next();
+})}
+function mqNet(c,room,me){
+ const pr={},hs={};let last=0,seen=0,lastJ='';
+ const T=NS+'g/'+room;
+ c.subscribe(T);
+ const pub=o=>{if(c.connected)c.publish(T,JSON.stringify(o))};
+ c.on('message',(tp,buf)=>{
+  if(tp!==T)return;let m;try{m=JSON.parse(buf.toString())}catch(e){return}
+  if(!m||m.f===me)return;
+  seen=Date.now();
+  if(m.t==='p')Object.assign(pr,m.d);
+  else if(m.t==='e'&&hs[m.tp])hs[m.tp]({isMe:false,data:m.d});
+  else if(m.t==='b')seen=0;
+ });
+ const hb=setInterval(()=>pub({f:me,t:'h'}),500);
  return{
-  presence(p){if(conn.open)conn.send({t:'p',d:p});return Promise.resolve()},
-  emit(tp,d){if(conn.open)conn.send({t:'e',tp,d});return Promise.resolve()},
+  presence(p){const j=JSON.stringify(p),n=Date.now();if(j!==lastJ||n-last>800){lastJ=j;last=n;pub({f:me,t:'p',d:p})}return Promise.resolve()},
+  emit(tp,d){pub({f:me,t:'e',tp,d});return Promise.resolve()},
   on(tp,f){hs[tp]=f},
-  peers(){return conn.open?[{isMe:true,presence:{}},{isMe:false,peer:conn.peer,presence:pr}]:[{isMe:true,presence:{}}]},
-  leave(){try{conn.close()}catch(e){}}
+  peers(){return[{isMe:true,presence:{}}].concat(Date.now()-seen<5000?[{isMe:false,peer:'opp',presence:pr}]:[])},
+  drop(){clearInterval(hb);try{c.unsubscribe(T)}catch(e){}},
+  leave(){clearInterval(hb);pub({f:me,t:'b'});setTimeout(()=>{try{c.end(true)}catch(e){}},300)}
  };
 }
-function tryHost(id){return new Promise(res=>{
- const p=new Peer(id);let done=false;
- const fin=v=>{if(!done){done=true;res(v);if(!v){try{p.destroy()}catch(_){}}}};
- p.on('open',()=>fin(p));p.on('error',e=>{if(e.type!=='unavailable-id')perr=e.type;fin(null)});setTimeout(()=>fin(null),6000);
-})}
-function tryGuest(id){return new Promise(res=>{
- const p=new Peer();let done=false;
- const fin=v=>{if(!done){done=true;res(v);if(!v){try{p.destroy()}catch(_){}}}};
- p.on('error',e=>{perr=e.type;fin(null)});
- p.on('open',()=>{const c=p.connect(id,{reliable:true});
-  c.on('data',m=>{if(m&&m.t==='hi')fin({p,c});else if(m&&m.t==='busy')fin(null)});
-  c.on('close',()=>fin(null));c.on('error',()=>fin(null))});
- setTimeout(()=>fin(null),5000);
-})}
-async function peerMatch(){
- while(state==='queue'&&!matched){
-  for(let s=1;s<=6&&state==='queue'&&!matched;s++){
-   const id='chromosduelo-v1-slot'+s;
-   const h=await tryHost(id);
-   if(h){
-    if(state!=='queue'){try{h.destroy()}catch(_){}return}
-    peerObj=h;
-    h.on('connection',c=>c.on('open',()=>{
-     if(matched||state!=='queue'){c.send({t:'busy'});setTimeout(()=>c.close(),300);return}
-     matched=true;c.send({t:'hi'});gr=mkNet(c);wireNet();newGame('online');
-    }));
-    const end=performance.now()+8000+Math.random()*4000;
-    while(state==='queue'&&!matched&&performance.now()<end)await sleep(200);
-    if(matched)return;
-    try{h.destroy()}catch(_){}peerObj=null;break;
-   }else{
-    const r=await tryGuest(id);
-    if(r&&state==='queue'){matched=true;peerObj=r.p;gr=mkNet(r.c);wireNet();newGame('online');return}
-    if(r){try{r.p.destroy()}catch(_){}}
+async function mqMatch(){
+ let c;try{c=await mqConnect()}catch(e){state='menu';msg='SEM CONEXAO COM SERVIDOR ONLINE';return}
+ if(state!=='queue'){try{c.end(true)}catch(e){}return}
+ mqc=c;const me=myId,myTs=Date.now(),seen={};
+ c.subscribe(NS+'lobby');
+ c.on('message',(tp,buf)=>{if(tp!==NS+'lobby')return;try{const m=JSON.parse(buf.toString());if(m&&typeof m.id==='string'&&m.id!==me&&typeof m.ts==='number')seen[m.id]={ts:m.ts,at:Date.now()}}catch(e){}});
+ while(state==='queue'&&mqc===c){
+  if(c.connected)c.publish(NS+'lobby',JSON.stringify({id:me,ts:myTs}));
+  const now=Date.now();
+  const q=Object.keys(seen).filter(k=>now-seen[k].at<3000).map(k=>({id:k,ts:seen[k].ts}));
+  q.push({id:me,ts:myTs});q.sort((a,b)=>a.ts-b.ts||(a.id<b.id?-1:1));
+  const i=q.findIndex(x=>x.id===me),j=i%2?i-1:i+1;
+  if(j<q.length){
+   const net=mqNet(c,[me,q[j].id].sort().join('-'),me),t0=Date.now();
+   while(state==='queue'&&mqc===c&&Date.now()-t0<6000&&net.peers().length<2)await sleep(250);
+   if(state==='queue'&&mqc===c&&net.peers().length>=2){
+    matched=true;try{c.unsubscribe(NS+'lobby')}catch(e){}
+    gr=net;wireNet();newGame('online');return;
    }
+   net.drop();
   }
-  await sleep(300);
+  await sleep(700);
  }
 }
+// MQTT-END
 function wireNet(){gr.on('shot',m=>{if(m.isMe||state==='menu')return;const d=m.data||{};if(d.r!==round)return;addHit(L[1],d.x,d.y,d.dx,d.dy,d.p)})}
 async function startMatch(a,b){
  const n=s=>s.toLowerCase().replace(/[^a-z0-9]/g,'');
@@ -171,7 +183,7 @@ async function startMatch(a,b){
   wait();
  }catch(e){endOnline();msg='FALHA NO MATCH';state='menu'}
 }
-function endOnline(){try{if(gr)gr.leave()}catch(e){}gr=null;try{if(peerObj)peerObj.destroy()}catch(e){}peerObj=null;if(room){room.presence({mm:null}).catch(()=>{})}matched=false}
+function endOnline(){try{if(gr)gr.leave()}catch(e){}gr=null;try{if(mqc)mqc.end(true)}catch(e){}mqc=null;if(room){room.presence({mm:null}).catch(()=>{})}matched=false}
 function toMenu(){endOnline();state='menu';mode=''}
 // ---------- entrada ----------
 function pos(e){const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height}}
@@ -246,7 +258,7 @@ function draw(){
   if(state==='menu'){
    btns.forEach(b=>{g.fillStyle='#300';g.fillRect(W/2-260,b.y-22,520,44);g.strokeStyle='#a00';g.lineWidth=2;g.strokeRect(W/2-260,b.y-22,520,44);txt(b.s,W/2,b.y+5,12,'#ff0')});
    if(msg)txt(msg,W/2,470,10,'#f55');
-   txt('VERSAO 3 - P2P '+(window.Peer?'OK':'SEM PEERJS'),W-14,H-12,8,'#c33','right');
+   txt('VERSAO 4 - MQTT '+(window.mqtt?'OK':'SEM MQTT'),W-14,H-12,8,'#c33','right');
   }else{
    const s=((performance.now()-qStart)/1000)|0;
    txt('PROCURANDO RIVAL'+'.'.repeat(1+(t/20|0)%3),W/2,340,16,'#ff0');
